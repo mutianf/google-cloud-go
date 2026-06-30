@@ -15,8 +15,10 @@
 package accelerator
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"testing"
 
 	v2pb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
@@ -33,10 +35,14 @@ import (
 // from mockSessionClient.OpenSessionTable.
 type mockSessionTableApi struct {
 	mutateRowFn func(ctx context.Context, req *v2pb.SessionMutateRowRequest) (*v2pb.SessionMutateRowResponse, error)
+	readRowFn   func(ctx context.Context, req *v2pb.SessionReadRowRequest) (*v2pb.SessionReadRowResponse, error)
 }
 
 func (m *mockSessionTableApi) ReadRow(ctx context.Context, req *v2pb.SessionReadRowRequest) (*v2pb.SessionReadRowResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "mock ReadRow")
+	if m.readRowFn != nil {
+		return m.readRowFn(ctx, req)
+	}
+	return &v2pb.SessionReadRowResponse{}, nil
 }
 
 func (m *mockSessionTableApi) MutateRow(ctx context.Context, req *v2pb.SessionMutateRowRequest) (*v2pb.SessionMutateRowResponse, error) {
@@ -195,18 +201,347 @@ func TestInvoke_UnknownMethod_ReturnsUnimplemented(t *testing.T) {
 	}
 }
 
-func TestNewStream_ReadRows_ReturnsStream(t *testing.T) {
-	channel := newTestChannel(t, &mockSessionClient{table: &mockSessionTableApi{}})
+func singleKeyReadRowsRequest(table, key string) *v2pb.ReadRowsRequest {
+	return &v2pb.ReadRowsRequest{
+		TableName: table,
+		Rows: &v2pb.RowSet{
+			RowKeys: [][]byte{[]byte(key)},
+		},
+	}
+}
+
+func TestNewStream_ReadRows_DispatchesThroughSessionAndAdaptsResponse(t *testing.T) {
+	gotKey := ""
+	tbl := &mockSessionTableApi{
+		readRowFn: func(_ context.Context, req *v2pb.SessionReadRowRequest) (*v2pb.SessionReadRowResponse, error) {
+			gotKey = string(req.Key)
+			return &v2pb.SessionReadRowResponse{
+				Row: &v2pb.Row{
+					Key: []byte("k"),
+					Families: []*v2pb.Family{{
+						Name: "fam",
+						Columns: []*v2pb.Column{{
+							Qualifier: []byte("q"),
+							Cells: []*v2pb.Cell{{
+								TimestampMicros: 42,
+								Value:           []byte("v"),
+							}},
+						}},
+					}},
+				},
+			}, nil
+		},
+	}
+	sc := &mockSessionClient{table: tbl}
+	channel := newTestChannel(t, sc)
 
 	stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
 	if err != nil {
-		t.Fatalf("NewStream(ReadRows) returned error: %v", err)
+		t.Fatalf("NewStream: %v", err)
 	}
-	if stream == nil {
-		t.Fatal("NewStream(ReadRows) returned nil stream")
+	if err := stream.SendMsg(singleKeyReadRowsRequest("projects/p/instances/i/tables/t", "k")); err != nil {
+		t.Fatalf("SendMsg: %v", err)
 	}
-	if got := status.Code(stream.RecvMsg(nil)); got != codes.Unimplemented {
-		t.Errorf("RecvMsg code = %v; want Unimplemented", got)
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+
+	resp := &v2pb.ReadRowsResponse{}
+	if err := stream.RecvMsg(resp); err != nil {
+		t.Fatalf("RecvMsg #1: %v", err)
+	}
+	if gotKey != "k" {
+		t.Errorf("session.ReadRow Key = %q; want %q", gotKey, "k")
+	}
+	if sc.lastTableName != "t" {
+		t.Errorf("NewSessionTable called with %q; want %q", sc.lastTableName, "t")
+	}
+	if len(resp.Chunks) != 1 {
+		t.Fatalf("Chunks len = %d; want 1", len(resp.Chunks))
+	}
+	cc := resp.Chunks[0]
+	if !bytes.Equal(cc.RowKey, []byte("k")) {
+		t.Errorf("Chunk.RowKey = %q; want k", cc.RowKey)
+	}
+	if cc.FamilyName == nil || cc.FamilyName.Value != "fam" {
+		t.Errorf("Chunk.FamilyName = %v; want fam", cc.FamilyName)
+	}
+	if cc.GetCommitRow() != true {
+		t.Errorf("Chunk.CommitRow = %v; want true", cc.GetCommitRow())
+	}
+
+	if err := stream.RecvMsg(&v2pb.ReadRowsResponse{}); err != io.EOF {
+		t.Errorf("RecvMsg #2 = %v; want io.EOF", err)
+	}
+}
+
+func TestNewStream_ReadRows_LazyDispatch(t *testing.T) {
+	called := false
+	tbl := &mockSessionTableApi{
+		readRowFn: func(_ context.Context, _ *v2pb.SessionReadRowRequest) (*v2pb.SessionReadRowResponse, error) {
+			called = true
+			return &v2pb.SessionReadRowResponse{}, nil
+		},
+	}
+	channel := newTestChannel(t, &mockSessionClient{table: tbl})
+
+	stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	if err := stream.SendMsg(singleKeyReadRowsRequest("projects/p/instances/i/tables/t", "k")); err != nil {
+		t.Fatalf("SendMsg: %v", err)
+	}
+	if called {
+		t.Fatal("session ReadRow invoked before RecvMsg — backpressure violated")
+	}
+	if err := stream.RecvMsg(&v2pb.ReadRowsResponse{}); err != nil {
+		t.Fatalf("RecvMsg: %v", err)
+	}
+	if !called {
+		t.Fatal("session ReadRow not invoked on first RecvMsg")
+	}
+}
+
+func TestNewStream_ReadRows_MissingRowEmitsEmptyResponseThenEOF(t *testing.T) {
+	tbl := &mockSessionTableApi{
+		readRowFn: func(_ context.Context, _ *v2pb.SessionReadRowRequest) (*v2pb.SessionReadRowResponse, error) {
+			return &v2pb.SessionReadRowResponse{}, nil // Row == nil
+		},
+	}
+	channel := newTestChannel(t, &mockSessionClient{table: tbl})
+
+	stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	if err := stream.SendMsg(singleKeyReadRowsRequest("projects/p/instances/i/tables/t", "k")); err != nil {
+		t.Fatalf("SendMsg: %v", err)
+	}
+	resp := &v2pb.ReadRowsResponse{}
+	if err := stream.RecvMsg(resp); err != nil {
+		t.Fatalf("RecvMsg: %v", err)
+	}
+	if len(resp.Chunks) != 0 {
+		t.Errorf("Chunks len = %d; want 0", len(resp.Chunks))
+	}
+	if err := stream.RecvMsg(&v2pb.ReadRowsResponse{}); err != io.EOF {
+		t.Errorf("RecvMsg #2 = %v; want io.EOF", err)
+	}
+}
+
+func TestNewStream_ReadRows_MultiKey_ReturnsUnimplemented(t *testing.T) {
+	channel := newTestChannel(t, &mockSessionClient{table: &mockSessionTableApi{}})
+	stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	req := &v2pb.ReadRowsRequest{
+		TableName: "projects/p/instances/i/tables/t",
+		Rows: &v2pb.RowSet{
+			RowKeys: [][]byte{[]byte("k1"), []byte("k2")},
+		},
+	}
+	err = stream.SendMsg(req)
+	if got := status.Code(err); got != codes.Unimplemented {
+		t.Errorf("SendMsg(multi-key) code = %v; want Unimplemented", got)
+	}
+}
+
+func TestNewStream_ReadRows_MixedKeysAndRanges_ReturnsUnimplemented(t *testing.T) {
+	channel := newTestChannel(t, &mockSessionClient{table: &mockSessionTableApi{}})
+	stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	req := &v2pb.ReadRowsRequest{
+		TableName: "projects/p/instances/i/tables/t",
+		Rows: &v2pb.RowSet{
+			RowKeys:   [][]byte{[]byte("k")},
+			RowRanges: []*v2pb.RowRange{{}},
+		},
+	}
+	err = stream.SendMsg(req)
+	if got := status.Code(err); got != codes.Unimplemented {
+		t.Errorf("SendMsg(mixed keys+ranges) code = %v; want Unimplemented", got)
+	}
+}
+
+// closedClosedRange builds a RowRange with equal closed bounds — the only
+// shape SessionReadRow can serve.
+func closedClosedRange(key string) *v2pb.RowRange {
+	return &v2pb.RowRange{
+		StartKey: &v2pb.RowRange_StartKeyClosed{StartKeyClosed: []byte(key)},
+		EndKey:   &v2pb.RowRange_EndKeyClosed{EndKeyClosed: []byte(key)},
+	}
+}
+
+func TestNewStream_ReadRows_SingleClosedClosedRange_DispatchesSingleRow(t *testing.T) {
+	gotKey := ""
+	tbl := &mockSessionTableApi{
+		readRowFn: func(_ context.Context, req *v2pb.SessionReadRowRequest) (*v2pb.SessionReadRowResponse, error) {
+			gotKey = string(req.Key)
+			return &v2pb.SessionReadRowResponse{}, nil
+		},
+	}
+	channel := newTestChannel(t, &mockSessionClient{table: tbl})
+
+	stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	req := &v2pb.ReadRowsRequest{
+		TableName: "projects/p/instances/i/tables/t",
+		Rows:      &v2pb.RowSet{RowRanges: []*v2pb.RowRange{closedClosedRange("k")}},
+	}
+	if err := stream.SendMsg(req); err != nil {
+		t.Fatalf("SendMsg: %v", err)
+	}
+	if err := stream.RecvMsg(&v2pb.ReadRowsResponse{}); err != nil {
+		t.Fatalf("RecvMsg: %v", err)
+	}
+	if gotKey != "k" {
+		t.Errorf("session.ReadRow Key = %q; want %q", gotKey, "k")
+	}
+}
+
+func TestNewStream_ReadRows_RangeRejects(t *testing.T) {
+	cases := []struct {
+		name  string
+		range_ *v2pb.RowRange
+	}{
+		{"unequal-closed-closed", &v2pb.RowRange{
+			StartKey: &v2pb.RowRange_StartKeyClosed{StartKeyClosed: []byte("a")},
+			EndKey:   &v2pb.RowRange_EndKeyClosed{EndKeyClosed: []byte("b")},
+		}},
+		{"closed-open", &v2pb.RowRange{
+			StartKey: &v2pb.RowRange_StartKeyClosed{StartKeyClosed: []byte("a")},
+			EndKey:   &v2pb.RowRange_EndKeyOpen{EndKeyOpen: []byte("a")},
+		}},
+		{"open-closed", &v2pb.RowRange{
+			StartKey: &v2pb.RowRange_StartKeyOpen{StartKeyOpen: []byte("a")},
+			EndKey:   &v2pb.RowRange_EndKeyClosed{EndKeyClosed: []byte("a")},
+		}},
+		{"unbounded", &v2pb.RowRange{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			channel := newTestChannel(t, &mockSessionClient{table: &mockSessionTableApi{}})
+			stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
+			if err != nil {
+				t.Fatalf("NewStream: %v", err)
+			}
+			req := &v2pb.ReadRowsRequest{
+				TableName: "projects/p/instances/i/tables/t",
+				Rows:      &v2pb.RowSet{RowRanges: []*v2pb.RowRange{tc.range_}},
+			}
+			err = stream.SendMsg(req)
+			if got := status.Code(err); got != codes.Unimplemented {
+				t.Errorf("SendMsg code = %v; want Unimplemented", got)
+			}
+		})
+	}
+}
+
+func TestNewStream_ReadRows_MultipleRanges_ReturnsUnimplemented(t *testing.T) {
+	channel := newTestChannel(t, &mockSessionClient{table: &mockSessionTableApi{}})
+	stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	req := &v2pb.ReadRowsRequest{
+		TableName: "projects/p/instances/i/tables/t",
+		Rows: &v2pb.RowSet{
+			RowRanges: []*v2pb.RowRange{closedClosedRange("a"), closedClosedRange("b")},
+		},
+	}
+	err = stream.SendMsg(req)
+	if got := status.Code(err); got != codes.Unimplemented {
+		t.Errorf("SendMsg(multi-range) code = %v; want Unimplemented", got)
+	}
+}
+
+func TestNewStream_ReadRows_PropagatesSessionError(t *testing.T) {
+	sentinel := errors.New("session boom")
+	tbl := &mockSessionTableApi{
+		readRowFn: func(_ context.Context, _ *v2pb.SessionReadRowRequest) (*v2pb.SessionReadRowResponse, error) {
+			return nil, sentinel
+		},
+	}
+	channel := newTestChannel(t, &mockSessionClient{table: tbl})
+
+	stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	if err := stream.SendMsg(singleKeyReadRowsRequest("projects/p/instances/i/tables/t", "k")); err != nil {
+		t.Fatalf("SendMsg: %v", err)
+	}
+	if err := stream.RecvMsg(&v2pb.ReadRowsResponse{}); !errors.Is(err, sentinel) {
+		t.Errorf("RecvMsg err = %v; want %v", err, sentinel)
+	}
+	if err := stream.RecvMsg(&v2pb.ReadRowsResponse{}); err != io.EOF {
+		t.Errorf("RecvMsg after error = %v; want io.EOF", err)
+	}
+}
+
+func TestNewStream_ReadRows_CachesPerTable(t *testing.T) {
+	tbl := &mockSessionTableApi{
+		readRowFn: func(_ context.Context, _ *v2pb.SessionReadRowRequest) (*v2pb.SessionReadRowResponse, error) {
+			return &v2pb.SessionReadRowResponse{}, nil
+		},
+	}
+	sc := &mockSessionClient{table: tbl}
+	channel := newTestChannel(t, sc)
+
+	for i := 0; i < 3; i++ {
+		stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
+		if err != nil {
+			t.Fatalf("NewStream iter %d: %v", i, err)
+		}
+		if err := stream.SendMsg(singleKeyReadRowsRequest("projects/p/instances/i/tables/t", "k")); err != nil {
+			t.Fatalf("SendMsg iter %d: %v", i, err)
+		}
+		if err := stream.RecvMsg(&v2pb.ReadRowsResponse{}); err != nil {
+			t.Fatalf("RecvMsg iter %d: %v", i, err)
+		}
+	}
+	if sc.newTableCalled != 1 {
+		t.Errorf("NewSessionTable called %d times across 3 same-table ReadRows; want 1", sc.newTableCalled)
+	}
+}
+
+func TestNewStream_ReadRows_SeparateCacheFromMutateRow(t *testing.T) {
+	tbl := &mockSessionTableApi{
+		readRowFn: func(_ context.Context, _ *v2pb.SessionReadRowRequest) (*v2pb.SessionReadRowResponse, error) {
+			return &v2pb.SessionReadRowResponse{}, nil
+		},
+	}
+	sc := &mockSessionClient{table: tbl}
+	channel := newTestChannel(t, sc)
+
+	stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	if err := stream.SendMsg(singleKeyReadRowsRequest("projects/p/instances/i/tables/t", "k")); err != nil {
+		t.Fatalf("SendMsg: %v", err)
+	}
+	if err := stream.RecvMsg(&v2pb.ReadRowsResponse{}); err != nil {
+		t.Fatalf("RecvMsg: %v", err)
+	}
+
+	if err := channel.Invoke(context.Background(),
+		v2pb.Bigtable_MutateRow_FullMethodName,
+		&v2pb.MutateRowRequest{
+			TableName: "projects/p/instances/i/tables/t",
+			RowKey:    []byte("k"),
+		}, &v2pb.MutateRowResponse{}); err != nil {
+		t.Fatalf("Invoke(MutateRow): %v", err)
+	}
+
+	if sc.newTableCalled != 2 {
+		t.Errorf("NewSessionTable called %d times; want 2 (one per method-keyed cache entry)", sc.newTableCalled)
 	}
 }
 
