@@ -22,7 +22,7 @@ import (
 	"testing"
 
 	v2pb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
-	"cloud.google.com/go/bigtable/accelerator/resourcemanager"
+	"cloud.google.com/go/bigtable/internal/accelerator/resourcemanager"
 	"cloud.google.com/go/bigtable/internal/session"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 	"go.opentelemetry.io/otel/metric"
@@ -407,7 +407,7 @@ func TestNewStream_ReadRows_SingleClosedClosedRange_DispatchesSingleRow(t *testi
 
 func TestNewStream_ReadRows_RangeRejects(t *testing.T) {
 	cases := []struct {
-		name  string
+		name   string
 		range_ *v2pb.RowRange
 	}{
 		{"unequal-closed-closed", &v2pb.RowRange{

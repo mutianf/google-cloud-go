@@ -27,7 +27,7 @@ import (
 	"flag"
 	"log"
 
-	"cloud.google.com/go/bigtable/accelerator"
+	"cloud.google.com/go/bigtable/internal/accelerator"
 	"google.golang.org/api/option"
 )
 
