@@ -29,10 +29,12 @@ import (
 	"context"
 	"io"
 
-	v2pb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"cloud.google.com/go/bigtable/accelerator/adapters"
 	"cloud.google.com/go/bigtable/accelerator/metrics"
 	"cloud.google.com/go/bigtable/accelerator/resourcemanager"
+	v2pb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	"cloud.google.com/go/bigtable/internal"
+	btopt "cloud.google.com/go/bigtable/internal/option"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -40,6 +42,19 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
+
+// Default data-plane dial parameters. These mirror the unexported
+// bigtable.prodAddr / mtlsProdAddr / Scope / clientUserAgent constants; they
+// are duplicated here (rather than imported) to keep the daemon from pulling
+// in the full bigtable client package, matching how internal/session already
+// duplicates its feature-flag metadata to avoid the same import cycle.
+const (
+	prodAddr     = "bigtable.UNIVERSE_DOMAIN:443"
+	mtlsProdAddr = "bigtable.mtls.googleapis.com:443"
+	dataScope    = "https://www.googleapis.com/auth/bigtable.data"
+)
+
+var userAgent = "cbt-go-accelerator/v" + internal.Version
 
 // Ensure AcceleratorChannel implements grpc.ClientConnInterface.
 var _ grpc.ClientConnInterface = (*AcceleratorChannel)(nil)
@@ -62,6 +77,18 @@ func NewAcceleratorChannel(
 	project, instance, appProfile string,
 	opts ...option.ClientOption,
 ) (*AcceleratorChannel, error) {
+	// session.NewSessionClient forwards opts straight to gtransport.Dial
+	// without supplying a default endpoint, so without these the dial target
+	// is empty ("received empty target in Build()"). Establish the standard
+	// Bigtable data-plane endpoint, scope, and user agent first, then let the
+	// caller's opts override. Mirrors bigtable.NewClient's use of
+	// btopt.DefaultClientOptions.
+	defaultOpts, err := btopt.DefaultClientOptions(prodAddr, mtlsProdAddr, dataScope, userAgent)
+	if err != nil {
+		return nil, err
+	}
+	opts = append(defaultOpts, opts...)
+
 	rm, err := resourcemanager.New(ctx, project, instance, appProfile, opts...)
 	if err != nil {
 		return nil, err

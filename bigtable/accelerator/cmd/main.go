@@ -28,6 +28,7 @@ import (
 	"log"
 
 	"cloud.google.com/go/bigtable/accelerator"
+	"google.golang.org/api/option"
 )
 
 func main() {
@@ -35,6 +36,12 @@ func main() {
 	project := flag.String("project", "", "GCP project ID (required)")
 	instance := flag.String("instance", "", "Bigtable instance ID (required)")
 	appProfile := flag.String("app-profile", "", "Bigtable app profile (optional)")
+	// Endpoint overrides. When empty, NewAcceleratorChannel falls back to the
+	// default Bigtable data-plane endpoint (bigtable.googleapis.com:443). The
+	// spawning client (e.g. the Python SDK) supplies these when it targets a
+	// non-default endpoint or a non-GDU universe.
+	dataEndpoint := flag.String("data-endpoint", "", "override Bigtable data-plane endpoint, e.g. bigtable.googleapis.com:443 (optional)")
+	universeDomain := flag.String("universe-domain", "", "override the service universe domain, e.g. googleapis.com (optional)")
 	flag.Parse()
 
 	if *udsPath == "" {
@@ -47,14 +54,24 @@ func main() {
 		log.Fatal("Missing required flag: --instance")
 	}
 
+	// Only forward overrides that were actually set; leaving them unset lets
+	// the default endpoint/universe-domain resolution apply.
+	var opts []option.ClientOption
+	if *dataEndpoint != "" {
+		opts = append(opts, option.WithEndpoint(*dataEndpoint))
+	}
+	if *universeDomain != "" {
+		opts = append(opts, option.WithUniverseDomain(*universeDomain))
+	}
+
 	ctx := context.Background()
-	channel, err := accelerator.NewAcceleratorChannel(ctx, *project, *instance, *appProfile)
+	channel, err := accelerator.NewAcceleratorChannel(ctx, *project, *instance, *appProfile, opts...)
 	if err != nil {
 		log.Fatalf("failed to construct accelerator channel: %v", err)
 	}
 	srv := accelerator.NewAcceleratorServer(*udsPath, channel)
-	log.Printf("Starting accelerator daemon on UDS=%s project=%s instance=%s app-profile=%q",
-		*udsPath, *project, *instance, *appProfile)
+	log.Printf("Starting accelerator daemon on UDS=%s project=%s instance=%s app-profile=%q data-endpoint=%q universe-domain=%q",
+		*udsPath, *project, *instance, *appProfile, *dataEndpoint, *universeDomain)
 
 	if err := srv.Start(); err != nil {
 		log.Fatalf("failed to start accelerator server: %v", err)
