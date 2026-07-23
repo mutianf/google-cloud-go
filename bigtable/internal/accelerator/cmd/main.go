@@ -26,6 +26,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"strings"
 
 	"cloud.google.com/go/bigtable/internal/accelerator"
 	"google.golang.org/api/option"
@@ -42,6 +43,11 @@ func main() {
 	// non-default endpoint or a non-GDU universe.
 	dataEndpoint := flag.String("data-endpoint", "", "override Bigtable data-plane endpoint, e.g. bigtable.googleapis.com:443 (optional)")
 	universeDomain := flag.String("universe-domain", "", "override the service universe domain, e.g. googleapis.com (optional)")
+	// Identity/auth knobs forwarded by the spawning client so the daemon
+	// reproduces the caller's configuration. Never a secret: credentials_file
+	// arrives via the inherited GOOGLE_APPLICATION_CREDENTIALS env, not a flag.
+	scopesFlag := flag.String("scopes", "", "comma-separated OAuth scopes to override the default data scope (optional)")
+	quotaProject := flag.String("quota-project", "", "quota/billing project override (optional)")
 	flag.Parse()
 
 	if *udsPath == "" {
@@ -63,6 +69,15 @@ func main() {
 	if *universeDomain != "" {
 		opts = append(opts, option.WithUniverseDomain(*universeDomain))
 	}
+	// Caller opts are appended after the channel's defaults, so WithScopes here
+	// overrides the hardcoded data scope.
+	scopes := splitScopes(*scopesFlag)
+	if len(scopes) > 0 {
+		opts = append(opts, option.WithScopes(scopes...))
+	}
+	if *quotaProject != "" {
+		opts = append(opts, option.WithQuotaProject(*quotaProject))
+	}
 
 	ctx := context.Background()
 	channel, err := accelerator.NewAcceleratorChannel(ctx, *project, *instance, *appProfile, opts...)
@@ -70,8 +85,15 @@ func main() {
 		log.Fatalf("failed to construct accelerator channel: %v", err)
 	}
 	srv := accelerator.NewAcceleratorServer(*udsPath, channel)
-	log.Printf("Starting accelerator daemon on UDS=%s project=%s instance=%s app-profile=%q data-endpoint=%q universe-domain=%q",
-		*udsPath, *project, *instance, *appProfile, *dataEndpoint, *universeDomain)
+	log.Printf("Starting accelerator daemon on UDS=%s project=%s instance=%s app-profile=%q data-endpoint=%q universe-domain=%q scopes=%q quota-project=%q",
+		*udsPath, *project, *instance, *appProfile, *dataEndpoint, *universeDomain, *scopesFlag, *quotaProject)
+
+	// Resolve and publish the daemon's identity BEFORE binding the socket, so
+	// the file is present by the time the client detects a connectable UDS.
+	// Non-fatal on failure: the client's verify step falls back to native.
+	if err := resolveAndWriteIdentity(ctx, *udsPath, scopes); err != nil {
+		log.Printf("warning: failed to write identity document: %v", err)
+	}
 
 	if err := srv.Start(); err != nil {
 		log.Fatalf("failed to start accelerator server: %v", err)
@@ -81,4 +103,17 @@ func main() {
 	// Block until the watchdog (stdin EOF or parent-PID change) trips.
 	<-srv.ShutdownChan()
 	log.Printf("Teardown signal detected, exiting...")
+}
+
+// splitScopes parses a comma-separated scopes flag into a trimmed, non-empty
+// slice. Returns an empty (non-nil) slice when the flag is empty or blank, so
+// callers get a consistent slice value and it marshals to [] rather than null.
+func splitScopes(raw string) []string {
+	scopes := []string{}
+	for _, s := range strings.Split(raw, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			scopes = append(scopes, s)
+		}
+	}
+	return scopes
 }
