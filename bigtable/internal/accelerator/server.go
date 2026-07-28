@@ -20,10 +20,13 @@
 package accelerator
 
 import (
+	"bufio"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,7 +42,9 @@ type AcceleratorServer struct {
 	listener     net.Listener
 	shutdownChan chan struct{}
 	stopOnce     sync.Once
-	StdinReader  io.Reader // Configurable stdin reader for testing
+	StdinReader  io.Reader    // Configurable stdin reader for testing; nil disables stdin watchdog
+	stdinBuf     *bufio.Reader // wraps StdinReader once in Start(); shared by readSecret + monitorStdin
+	authSecret   string
 	channel      *AcceleratorChannel
 }
 
@@ -57,6 +62,14 @@ func NewAcceleratorServer(udsPath string, channel *AcceleratorChannel) *Accelera
 
 // Start boots the gRPC server on the Unix Domain Socket asynchronously.
 func (s *AcceleratorServer) Start() error {
+	// Read the auth secret from stdin BEFORE binding — Python mints the secret
+	// before Popen returns, so it is always present on the pipe.
+	if s.StdinReader != nil {
+		if err := s.readSecret(); err != nil {
+			return err
+		}
+	}
+
 	_ = os.Remove(s.udsPath)
 
 	l, err := net.Listen("unix", s.udsPath)
@@ -77,12 +90,18 @@ func (s *AcceleratorServer) Start() error {
 		return err
 	}
 
-	// The unary interceptor short-circuits every unary RPC and routes it
-	// through the AcceleratorChannel. The stream interceptor does the same
-	// for server-streaming RPCs (ReadRows today).
+	// Auth interceptors run first; when authSecret is empty (test mode with
+	// StdinReader=nil) they are no-ops. Proxy interceptors follow and route
+	// each RPC through the AcceleratorChannel.
 	s.grpcServer = grpc.NewServer(
-		grpc.UnaryInterceptor(proxyUnaryInterceptor(s.channel)),
-		grpc.StreamInterceptor(proxyStreamInterceptor(s.channel)),
+		grpc.ChainUnaryInterceptor(
+			authUnaryInterceptor(s.authSecret),
+			proxyUnaryInterceptor(s.channel),
+		),
+		grpc.ChainStreamInterceptor(
+			authStreamInterceptor(s.authSecret),
+			proxyStreamInterceptor(s.channel),
+		),
 	)
 
 	// Register the empty bigtableServerStub. gRPC requires a typed
@@ -127,11 +146,44 @@ func (s *AcceleratorServer) Stop() {
 	})
 }
 
+// readSecret reads the auth secret written by the Python parent process to
+// stdin before the daemon binds. It wraps StdinReader once in a bufio.Reader
+// (stored as s.stdinBuf) so monitorStdin can continue consuming the same
+// buffered stream without losing bytes.
+//
+// An empty or whitespace-only secret is rejected so the daemon fails closed:
+// serving with an empty authSecret would disable the auth interceptor (see
+// checkAuthToken), so we refuse to start rather than accept unauthenticated
+// callers. This guarantees the shipped binary — which always feeds os.Stdin —
+// either has a real secret or never binds the socket.
+func (s *AcceleratorServer) readSecret() error {
+	s.stdinBuf = bufio.NewReader(s.StdinReader)
+	line, err := s.stdinBuf.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("accelerator: failed to read auth secret from stdin: %w", err)
+	}
+	secret := strings.TrimSpace(line)
+	if secret == "" {
+		return fmt.Errorf("accelerator: received empty auth secret from stdin; refusing to serve unauthenticated")
+	}
+	s.authSecret = secret
+	return nil
+}
+
 // monitorStdin monitors standard input for an EOF signal. Tests that don't
 // want this watchdog set StdinReader to nil.
 func (s *AcceleratorServer) monitorStdin() {
 	if s.StdinReader == nil {
 		return
+	}
+	// Use the buffered reader created by readSecret so bytes already consumed
+	// into the buffer are not lost (in practice stdin only carries the secret
+	// line followed by EOF, but using the same reader is correct).
+	var r io.Reader
+	if s.stdinBuf != nil {
+		r = s.stdinBuf
+	} else {
+		r = s.StdinReader
 	}
 	buf := make([]byte, 1)
 	for {
@@ -139,7 +191,7 @@ func (s *AcceleratorServer) monitorStdin() {
 		case <-s.shutdownChan:
 			return
 		default:
-			_, err := s.StdinReader.Read(buf)
+			_, err := r.Read(buf)
 			if err != nil {
 				s.Stop()
 				return

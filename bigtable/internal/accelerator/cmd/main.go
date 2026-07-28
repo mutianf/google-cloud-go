@@ -43,9 +43,6 @@ func main() {
 	// non-default endpoint or a non-GDU universe.
 	dataEndpoint := flag.String("data-endpoint", "", "override Bigtable data-plane endpoint, e.g. bigtable.googleapis.com:443 (optional)")
 	universeDomain := flag.String("universe-domain", "", "override the service universe domain, e.g. googleapis.com (optional)")
-	// Identity/auth knobs forwarded by the spawning client so the daemon
-	// reproduces the caller's configuration. Never a secret: credentials_file
-	// arrives via the inherited GOOGLE_APPLICATION_CREDENTIALS env, not a flag.
 	scopesFlag := flag.String("scopes", "", "comma-separated OAuth scopes to override the default data scope (optional)")
 	quotaProject := flag.String("quota-project", "", "quota/billing project override (optional)")
 	flag.Parse()
