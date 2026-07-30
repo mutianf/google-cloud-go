@@ -54,11 +54,19 @@ func (m *mockSessionTableApi) MutateRow(ctx context.Context, req *v2pb.SessionMu
 
 func (m *mockSessionTableApi) Close() error { return nil }
 
-// mockSessionClient hands back a fixed SessionTableApi for any table name.
+// mockSessionClient hands back a fixed SessionTableApi for any resource and
+// records the leaf arguments each Open* method was called with, plus a per-kind
+// open counter, so tests can assert dispatch routing.
 type mockSessionClient struct {
 	table          session.TableAPI
 	lastTableName  string
 	newTableCalled int
+
+	lastAVTable string
+	lastAVView  string
+	newAVCalled int
+	lastMVView  string
+	newMVCalled int
 }
 
 func (m *mockSessionClient) OpenTable(name string) session.TableAPI {
@@ -67,11 +75,15 @@ func (m *mockSessionClient) OpenTable(name string) session.TableAPI {
 	return m.table
 }
 
-func (m *mockSessionClient) OpenAuthorizedView(_, _ string) session.TableAPI {
+func (m *mockSessionClient) OpenAuthorizedView(table, view string) session.TableAPI {
+	m.lastAVTable, m.lastAVView = table, view
+	m.newAVCalled++
 	return m.table
 }
 
-func (m *mockSessionClient) OpenMaterializedView(_ string) session.TableAPI {
+func (m *mockSessionClient) OpenMaterializedView(view string) session.TableAPI {
+	m.lastMVView = view
+	m.newMVCalled++
 	return m.table
 }
 
@@ -148,6 +160,30 @@ func TestInvoke_MutateRow_DispatchesThroughSession(t *testing.T) {
 	}
 	if sc.lastTableName != "t" {
 		t.Errorf("Expected NewSessionTable called with leaf %q; got %q", "t", sc.lastTableName)
+	}
+}
+
+func TestInvoke_MutateRow_RoutesToAuthorizedView(t *testing.T) {
+	sc := &mockSessionClient{table: &mockSessionTableApi{}}
+	channel := newTestChannel(t, sc)
+
+	reqV2 := &v2pb.MutateRowRequest{
+		AuthorizedViewName: "projects/p/instances/i/tables/t/authorizedViews/v",
+		RowKey:             []byte("k"),
+	}
+	if err := channel.Invoke(context.Background(),
+		v2pb.Bigtable_MutateRow_FullMethodName,
+		reqV2, &v2pb.MutateRowResponse{}); err != nil {
+		t.Fatalf("Invoke(MutateRow) error: %v", err)
+	}
+	if sc.newAVCalled != 1 {
+		t.Errorf("OpenAuthorizedView called %d times; want 1", sc.newAVCalled)
+	}
+	if sc.lastAVTable != "t" || sc.lastAVView != "v" {
+		t.Errorf("OpenAuthorizedView(table, view) = (%q, %q); want (t, v)", sc.lastAVTable, sc.lastAVView)
+	}
+	if sc.newTableCalled != 0 {
+		t.Errorf("OpenTable called %d times; want 0 (authorized view request)", sc.newTableCalled)
 	}
 }
 
@@ -275,6 +311,64 @@ func TestNewStream_ReadRows_DispatchesThroughSessionAndAdaptsResponse(t *testing
 
 	if err := stream.RecvMsg(&v2pb.ReadRowsResponse{}); err != io.EOF {
 		t.Errorf("RecvMsg #2 = %v; want io.EOF", err)
+	}
+}
+
+func TestNewStream_ReadRows_RoutesToAuthorizedView(t *testing.T) {
+	sc := &mockSessionClient{table: &mockSessionTableApi{}}
+	channel := newTestChannel(t, sc)
+
+	stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	req := &v2pb.ReadRowsRequest{
+		AuthorizedViewName: "projects/p/instances/i/tables/t/authorizedViews/v",
+		Rows:               &v2pb.RowSet{RowKeys: [][]byte{[]byte("k")}},
+	}
+	if err := stream.SendMsg(req); err != nil {
+		t.Fatalf("SendMsg: %v", err)
+	}
+	if err := stream.RecvMsg(&v2pb.ReadRowsResponse{}); err != nil {
+		t.Fatalf("RecvMsg: %v", err)
+	}
+	if sc.newAVCalled != 1 {
+		t.Errorf("OpenAuthorizedView called %d times; want 1", sc.newAVCalled)
+	}
+	if sc.lastAVTable != "t" || sc.lastAVView != "v" {
+		t.Errorf("OpenAuthorizedView(table, view) = (%q, %q); want (t, v)", sc.lastAVTable, sc.lastAVView)
+	}
+	if sc.newTableCalled != 0 {
+		t.Errorf("OpenTable called %d times; want 0 (authorized view request)", sc.newTableCalled)
+	}
+}
+
+func TestNewStream_ReadRows_RoutesToMaterializedView(t *testing.T) {
+	sc := &mockSessionClient{table: &mockSessionTableApi{}}
+	channel := newTestChannel(t, sc)
+
+	stream, err := channel.NewStream(context.Background(), nil, v2pb.Bigtable_ReadRows_FullMethodName)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	req := &v2pb.ReadRowsRequest{
+		MaterializedViewName: "projects/p/instances/i/materializedViews/mv",
+		Rows:                 &v2pb.RowSet{RowKeys: [][]byte{[]byte("k")}},
+	}
+	if err := stream.SendMsg(req); err != nil {
+		t.Fatalf("SendMsg: %v", err)
+	}
+	if err := stream.RecvMsg(&v2pb.ReadRowsResponse{}); err != nil {
+		t.Fatalf("RecvMsg: %v", err)
+	}
+	if sc.newMVCalled != 1 {
+		t.Errorf("OpenMaterializedView called %d times; want 1", sc.newMVCalled)
+	}
+	if sc.lastMVView != "mv" {
+		t.Errorf("OpenMaterializedView view = %q; want %q", sc.lastMVView, "mv")
+	}
+	if sc.newTableCalled != 0 {
+		t.Errorf("OpenTable called %d times; want 0 (materialized view request)", sc.newTableCalled)
 	}
 }
 

@@ -95,7 +95,38 @@ func noopRelease() {}
 // routes reads and writes to their respective pools internally. The returned
 // release thunk is a no-op.
 func (rm *ResourceManager) GetSessionTable(resource, method string) (session.TableAPI, func(), error) {
-	return rm.sc.OpenTable(tableLeaf(resource)), noopRelease, nil
+	return rm.sc.OpenTable(resourceLeaf(resource)), noopRelease, nil
+}
+
+// GetSessionAuthorizedView returns a session.TableAPI for the authorized view
+// named by resource.
+//
+// Wire format note: V2 RPCs carry a full authorized-view resource name
+// ("projects/P/instances/I/tables/T/authorizedViews/V").
+// session.Client.OpenAuthorizedView takes the table and view leaf segments and
+// composes the full name itself, so ResourceManager splits them out here.
+//
+// method is accepted for call-site clarity ("ReadRow" / "MutateRow") and, as
+// with GetSessionTable, does not affect which handle is returned. The returned
+// release thunk is a no-op.
+func (rm *ResourceManager) GetSessionAuthorizedView(resource, method string) (session.TableAPI, func(), error) {
+	table, view := authorizedViewLeaves(resource)
+	return rm.sc.OpenAuthorizedView(table, view), noopRelease, nil
+}
+
+// GetSessionMaterializedView returns a read-only session.TableAPI for the
+// materialized view named by resource.
+//
+// Wire format note: V2 RPCs carry a full materialized-view resource name
+// ("projects/P/instances/I/materializedViews/V").
+// session.Client.OpenMaterializedView takes the view leaf segment and composes
+// the full name itself. Materialized views are read-only; MutateRow on the
+// returned handle errors.
+//
+// method is accepted for call-site clarity; see GetSessionTable. The returned
+// release thunk is a no-op.
+func (rm *ResourceManager) GetSessionMaterializedView(resource, method string) (session.TableAPI, func(), error) {
+	return rm.sc.OpenMaterializedView(resourceLeaf(resource)), noopRelease, nil
 }
 
 // Close closes the underlying session Client, tearing down its pools. Handles
@@ -107,11 +138,26 @@ func (rm *ResourceManager) Close() error {
 	return nil
 }
 
-// tableLeaf extracts the leaf "T" from "projects/P/instances/I/tables/T".
-// Returns the input unchanged if it does not have a "/" — best-effort.
-func tableLeaf(fullName string) string {
+// resourceLeaf extracts the last path segment from a full resource name — e.g.
+// "T" from "projects/P/instances/I/tables/T", or "V" from
+// "projects/P/instances/I/materializedViews/V". Returns the input unchanged if
+// it does not contain a "/" — best-effort.
+func resourceLeaf(fullName string) string {
 	if i := strings.LastIndex(fullName, "/"); i >= 0 {
 		return fullName[i+1:]
 	}
 	return fullName
+}
+
+// authorizedViewLeaves splits a full authorized-view resource name
+// ("projects/P/instances/I/tables/T/authorizedViews/V") into its table ("T")
+// and view ("V") leaf segments, which is what session.Client.OpenAuthorizedView
+// expects. Best-effort: if the "/authorizedViews/" marker is absent, the whole
+// input is treated as the view leaf and table is returned empty.
+func authorizedViewLeaves(fullName string) (table, view string) {
+	const marker = "/authorizedViews/"
+	if i := strings.Index(fullName, marker); i >= 0 {
+		return resourceLeaf(fullName[:i]), resourceLeaf(fullName[i+len(marker):])
+	}
+	return "", resourceLeaf(fullName)
 }

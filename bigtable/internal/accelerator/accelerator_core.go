@@ -35,6 +35,7 @@ import (
 	"cloud.google.com/go/bigtable/internal/accelerator/metrics"
 	"cloud.google.com/go/bigtable/internal/accelerator/resourcemanager"
 	btopt "cloud.google.com/go/bigtable/internal/option"
+	"cloud.google.com/go/bigtable/internal/session"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -99,6 +100,20 @@ func NewAcceleratorChannel(
 	}, nil
 }
 
+// openSession routes an extracted resource to the matching ResourceManager
+// handle based on its kind. The adapter already determined the kind from the
+// populated V2 name field, so no name inspection happens here.
+func (c *AcceleratorChannel) openSession(res adapters.Resource, method string) (session.TableAPI, func(), error) {
+	switch res.Kind {
+	case adapters.ResourceAuthorizedView:
+		return c.rm.GetSessionAuthorizedView(res.Name, method)
+	case adapters.ResourceMaterializedView:
+		return c.rm.GetSessionMaterializedView(res.Name, method)
+	default:
+		return c.rm.GetSessionTable(res.Name, method)
+	}
+}
+
 // Invoke implements grpc.ClientConnInterface for unary V2 RPCs.
 func (c *AcceleratorChannel) Invoke(ctx context.Context, method string, args, reply interface{}, _ ...grpc.CallOption) error {
 	switch method {
@@ -129,10 +144,11 @@ func (c *AcceleratorChannel) mutateRowImpl(ctx context.Context, args, reply inte
 		return err
 	}
 
-	// ResourceManager opens a fresh handle per call; the underlying read/
-	// write session pools are deduped inside session.Client, so this is
-	// cheap. release is a no-op (handles are not pooled at this layer).
-	tbl, release, err := c.rm.GetSessionTable(resource, "MutateRow")
+	// ResourceManager opens a fresh handle per call, routed to a table or
+	// authorized view by the resource kind; the underlying read/write session
+	// pools are deduped inside session.Client, so this is cheap. release is a
+	// no-op (handles are not pooled at this layer).
+	tbl, release, err := c.openSession(resource, "MutateRow")
 	if err != nil {
 		return err
 	}
@@ -251,7 +267,9 @@ func (s *readRowsClientStream) RecvMsg(m any) error {
 		return err
 	}
 
-	tbl, release, err := s.c.rm.GetSessionTable(resource, "ReadRow")
+	// Routed to a table, authorized view, or materialized view by the
+	// resource kind the adapter extracted.
+	tbl, release, err := s.c.openSession(resource, "ReadRow")
 	if err != nil {
 		s.done = true
 		return err

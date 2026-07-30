@@ -1,8 +1,11 @@
 package adapters
 
 import (
-	v2pb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"testing"
+
+	v2pb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestMutateRowRequestAdapter(t *testing.T) {
@@ -50,8 +53,47 @@ func TestMutateRowRequestAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExtractResource failed: %v", err)
 	}
-	if res != "projects/p1/instances/i1/tables/t1" {
-		t.Errorf("expected resource projects/p1/instances/i1/tables/t1, got %s", res)
+	if res.Kind != ResourceTable || res.Name != "projects/p1/instances/i1/tables/t1" {
+		t.Errorf("ExtractResource = %+v; want {ResourceTable, projects/p1/instances/i1/tables/t1}", res)
+	}
+}
+
+func TestMutateRowRequestAdapter_ExtractResource(t *testing.T) {
+	reqAdapter := &MutateRowRequestAdapter{}
+	cases := []struct {
+		name string
+		req  *v2pb.MutateRowRequest
+		want Resource
+	}{
+		{
+			"table",
+			&v2pb.MutateRowRequest{TableName: "projects/p/instances/i/tables/t"},
+			Resource{Kind: ResourceTable, Name: "projects/p/instances/i/tables/t"},
+		},
+		{
+			"authorized-view",
+			&v2pb.MutateRowRequest{AuthorizedViewName: "projects/p/instances/i/tables/t/authorizedViews/v"},
+			Resource{Kind: ResourceAuthorizedView, Name: "projects/p/instances/i/tables/t/authorizedViews/v"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := reqAdapter.ExtractResource(tc.req)
+			if err != nil {
+				t.Fatalf("ExtractResource: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("ExtractResource = %+v; want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMutateRowRequestAdapter_ExtractResource_Empty(t *testing.T) {
+	reqAdapter := &MutateRowRequestAdapter{}
+	_, err := reqAdapter.ExtractResource(&v2pb.MutateRowRequest{})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("ExtractResource(empty) code = %v; want InvalidArgument", status.Code(err))
 	}
 }
 

@@ -29,11 +29,24 @@ func (a *ReadRowRequestAdapter) Adapt(from *v2pb.ReadRowsRequest) (*v2pb.Session
 	return req, nil
 }
 
-func (a *ReadRowRequestAdapter) ExtractResource(from *v2pb.ReadRowsRequest) (string, error) {
+// ExtractResource returns the resource the request targets, tagged with its
+// kind. A ReadRowsRequest names exactly one of a table, an authorized view, or
+// a materialized view; the more-specific fields are checked first so the
+// correct resource is surfaced regardless of which the caller populated.
+func (a *ReadRowRequestAdapter) ExtractResource(from *v2pb.ReadRowsRequest) (Resource, error) {
 	if from == nil {
-		return "", status.Errorf(codes.InvalidArgument, "request is nil")
+		return Resource{}, status.Errorf(codes.InvalidArgument, "request is nil")
 	}
-	return from.TableName, nil
+	switch {
+	case from.MaterializedViewName != "":
+		return Resource{Kind: ResourceMaterializedView, Name: from.MaterializedViewName}, nil
+	case from.AuthorizedViewName != "":
+		return Resource{Kind: ResourceAuthorizedView, Name: from.AuthorizedViewName}, nil
+	case from.TableName != "":
+		return Resource{Kind: ResourceTable, Name: from.TableName}, nil
+	default:
+		return Resource{}, status.Errorf(codes.InvalidArgument, "ReadRowsRequest names no table, authorized view, or materialized view")
+	}
 }
 
 // ReadRowResponseAdapter adapts SessionReadRowResponse to ReadRowsResponse,

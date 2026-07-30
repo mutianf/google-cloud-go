@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	v2pb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestReadRowRequestAdapter(t *testing.T) {
@@ -39,8 +41,52 @@ func TestReadRowRequestAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExtractResource failed: %v", err)
 	}
-	if res != "projects/p1/instances/i1/tables/t1" {
-		t.Errorf("expected resource projects/p1/instances/i1/tables/t1, got %s", res)
+	if res.Kind != ResourceTable || res.Name != "projects/p1/instances/i1/tables/t1" {
+		t.Errorf("ExtractResource = %+v; want {ResourceTable, projects/p1/instances/i1/tables/t1}", res)
+	}
+}
+
+func TestReadRowRequestAdapter_ExtractResource(t *testing.T) {
+	reqAdapter := &ReadRowRequestAdapter{}
+	cases := []struct {
+		name string
+		req  *v2pb.ReadRowsRequest
+		want Resource
+	}{
+		{
+			"table",
+			&v2pb.ReadRowsRequest{TableName: "projects/p/instances/i/tables/t"},
+			Resource{Kind: ResourceTable, Name: "projects/p/instances/i/tables/t"},
+		},
+		{
+			"authorized-view",
+			&v2pb.ReadRowsRequest{AuthorizedViewName: "projects/p/instances/i/tables/t/authorizedViews/v"},
+			Resource{Kind: ResourceAuthorizedView, Name: "projects/p/instances/i/tables/t/authorizedViews/v"},
+		},
+		{
+			"materialized-view",
+			&v2pb.ReadRowsRequest{MaterializedViewName: "projects/p/instances/i/materializedViews/mv"},
+			Resource{Kind: ResourceMaterializedView, Name: "projects/p/instances/i/materializedViews/mv"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := reqAdapter.ExtractResource(tc.req)
+			if err != nil {
+				t.Fatalf("ExtractResource: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("ExtractResource = %+v; want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReadRowRequestAdapter_ExtractResource_Empty(t *testing.T) {
+	reqAdapter := &ReadRowRequestAdapter{}
+	_, err := reqAdapter.ExtractResource(&v2pb.ReadRowsRequest{})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("ExtractResource(empty) code = %v; want InvalidArgument", status.Code(err))
 	}
 }
 

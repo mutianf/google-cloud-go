@@ -19,11 +19,23 @@ func (a *MutateRowRequestAdapter) Adapt(from *v2pb.MutateRowRequest) (*v2pb.Sess
 	}, nil
 }
 
-func (a *MutateRowRequestAdapter) ExtractResource(from *v2pb.MutateRowRequest) (string, error) {
+// ExtractResource returns the resource the request targets, tagged with its
+// kind. A MutateRowRequest names either a table or an authorized view
+// (materialized views are read-only and have no field here); the authorized
+// view is checked first so the correct resource is surfaced regardless of which
+// the caller populated.
+func (a *MutateRowRequestAdapter) ExtractResource(from *v2pb.MutateRowRequest) (Resource, error) {
 	if from == nil {
-		return "", status.Errorf(codes.InvalidArgument, "request is nil")
+		return Resource{}, status.Errorf(codes.InvalidArgument, "request is nil")
 	}
-	return from.TableName, nil
+	switch {
+	case from.AuthorizedViewName != "":
+		return Resource{Kind: ResourceAuthorizedView, Name: from.AuthorizedViewName}, nil
+	case from.TableName != "":
+		return Resource{Kind: ResourceTable, Name: from.TableName}, nil
+	default:
+		return Resource{}, status.Errorf(codes.InvalidArgument, "MutateRowRequest names no table or authorized view")
+	}
 }
 
 // MutateRowResponseAdapter adapts SessionMutateRowResponse to MutateRowResponse.
