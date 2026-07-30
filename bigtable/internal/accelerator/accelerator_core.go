@@ -77,7 +77,7 @@ func NewAcceleratorChannel(
 	project, instance, appProfile string,
 	opts ...option.ClientOption,
 ) (*AcceleratorChannel, error) {
-	// session.NewSessionClient forwards opts straight to gtransport.Dial
+	// session.NewClient forwards opts straight to gtransport.Dial
 	// without supplying a default endpoint, so without these the dial target
 	// is empty ("received empty target in Build()"). Establish the standard
 	// Bigtable data-plane endpoint, scope, and user agent first, then let the
@@ -156,7 +156,7 @@ func (c *AcceleratorChannel) mutateRowImpl(ctx context.Context, args, reply inte
 }
 
 // NewStream implements grpc.ClientConnInterface for streaming V2 RPCs.
-// ReadRows is dispatched through session.SessionTableApi.ReadRow lazily: the
+// ReadRows is dispatched through session.TableAPI.ReadRow lazily: the
 // session call is deferred until the first RecvMsg so the consumer's pull
 // rate controls when work happens.
 func (c *AcceleratorChannel) NewStream(ctx context.Context, _ *grpc.StreamDesc, method string, _ ...grpc.CallOption) (grpc.ClientStream, error) {

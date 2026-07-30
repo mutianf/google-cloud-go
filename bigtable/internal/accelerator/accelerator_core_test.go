@@ -31,8 +31,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// mockSessionTableApi is a session.SessionTableApi stub the tests hand back
-// from mockSessionClient.OpenSessionTable.
+// mockSessionTableApi is a session.TableAPI stub the tests hand back
+// from mockSessionClient.OpenTable.
 type mockSessionTableApi struct {
 	mutateRowFn func(ctx context.Context, req *v2pb.SessionMutateRowRequest) (*v2pb.SessionMutateRowResponse, error)
 	readRowFn   func(ctx context.Context, req *v2pb.SessionReadRowRequest) (*v2pb.SessionReadRowResponse, error)
@@ -56,22 +56,22 @@ func (m *mockSessionTableApi) Close() error { return nil }
 
 // mockSessionClient hands back a fixed SessionTableApi for any table name.
 type mockSessionClient struct {
-	table          session.SessionTableApi
+	table          session.TableAPI
 	lastTableName  string
 	newTableCalled int
 }
 
-func (m *mockSessionClient) OpenSessionTable(name string) session.SessionTableApi {
+func (m *mockSessionClient) OpenTable(name string) session.TableAPI {
 	m.lastTableName = name
 	m.newTableCalled++
 	return m.table
 }
 
-func (m *mockSessionClient) OpenAuthorizedView(_, _ string) session.SessionTableApi {
+func (m *mockSessionClient) OpenAuthorizedView(_, _ string) session.TableAPI {
 	return m.table
 }
 
-func (m *mockSessionClient) OpenMaterializedView(_ string) session.SessionTableApi {
+func (m *mockSessionClient) OpenMaterializedView(_ string) session.TableAPI {
 	return m.table
 }
 
@@ -95,7 +95,7 @@ func stubSessionClient(t *testing.T, sc *mockSessionClient) {
 		_ context.Context,
 		_, _, _ string,
 		_ ...option.ClientOption,
-	) (session.SessionClient, error) {
+	) (session.Client, error) {
 		return sc, nil
 	})
 	t.Cleanup(restore)

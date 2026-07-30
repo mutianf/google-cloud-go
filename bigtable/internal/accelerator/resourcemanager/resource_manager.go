@@ -22,25 +22,25 @@ import (
 	"google.golang.org/api/option"
 )
 
-// SessionClientFactory constructs the underlying SessionClient for a
-// ResourceManager. The default factory wraps session.NewSessionClient.
+// SessionClientFactory constructs the underlying session Client for a
+// ResourceManager. The default factory wraps session.NewClient.
 type SessionClientFactory = func(
 	ctx context.Context,
 	project, instance, appProfile string,
 	opts ...option.ClientOption,
-) (session.SessionClient, error)
+) (session.Client, error)
 
 // newSessionClient is the factory ResourceManager.New uses to construct the
-// underlying SessionClient. Tests override this via TestHookSessionClient.
+// underlying session Client. Tests override this via TestHookSessionClient.
 var newSessionClient SessionClientFactory = func(
 	ctx context.Context,
 	project, instance, appProfile string,
 	opts ...option.ClientOption,
-) (session.SessionClient, error) {
-	return session.NewSessionClient(ctx, project, instance, appProfile, nil, opts...)
+) (session.Client, error) {
+	return session.NewClient(ctx, project, instance, appProfile, nil, opts...)
 }
 
-// TestHookSessionClient swaps the SessionClient factory used by New for the
+// TestHookSessionClient swaps the session Client factory used by New for the
 // duration of a test. Returns a restore function the test must call (typically
 // via t.Cleanup) to revert. Package-level state mutation is not parallel-safe.
 func TestHookSessionClient(f SessionClientFactory) func() {
@@ -49,23 +49,23 @@ func TestHookSessionClient(f SessionClientFactory) func() {
 	return func() { newSessionClient = orig }
 }
 
-// ResourceManager owns a SessionClient and a PoolCache of per-(resource,
-// method) SessionTableApi instances. On cache hit, GetSessionTable returns
+// ResourceManager owns a session Client and a PoolCache of per-(resource,
+// method) session.TableAPI instances. On cache hit, GetSessionTable returns
 // the cached entry without consulting SessionClient. On miss, it opens a
-// fresh SessionTableApi via the SessionClient and caches it.
+// fresh session.TableAPI via the session Client and caches it.
 //
 // Wire format note: V2 RPCs carry a full table resource name
-// ("projects/P/instances/I/tables/T"). session.SessionClient.OpenSessionTable
+// ("projects/P/instances/I/tables/T"). session.Client.OpenTable
 // prepends the project/instance/tables/ prefix itself, so ResourceManager
 // hands it just the leaf segment.
 type ResourceManager struct {
-	sc    session.SessionClient
-	cache *PoolCache[session.SessionTableApi]
+	sc    session.Client
+	cache *PoolCache[session.TableAPI]
 }
 
 // New dials Bigtable via internal/session and constructs a ResourceManager
 // scoped to (project, instance, appProfile). The ResourceManager takes
-// ownership of the SessionClient — Close releases the cache and then the
+// ownership of the session Client — Close releases the cache and then the
 // SessionClient connection.
 func New(
 	ctx context.Context,
@@ -77,27 +77,27 @@ func New(
 		return nil, err
 	}
 	rm := &ResourceManager{sc: sc}
-	rm.cache = NewPoolCache[session.SessionTableApi](DefaultPoolCacheSize, rm.openSessionTable)
+	rm.cache = NewPoolCache[session.TableAPI](DefaultPoolCacheSize, rm.openSessionTable)
 	return rm, nil
 }
 
 // openSessionTable is the PoolCache factory invoked on cache miss. It is a
 // method (not a closure) so ResourceManager.sc remains the only reference to
-// the SessionClient — no captured-state lifetime issues.
-func (rm *ResourceManager) openSessionTable(resource, _ string) (session.SessionTableApi, error) {
-	return rm.sc.OpenSessionTable(tableLeaf(resource)), nil
+// the session Client — no captured-state lifetime issues.
+func (rm *ResourceManager) openSessionTable(resource, _ string) (session.TableAPI, error) {
+	return rm.sc.OpenTable(tableLeaf(resource)), nil
 }
 
-// GetSessionTable returns the cached SessionTableApi for (resource, method),
-// constructing one via SessionClient on cache miss. The returned release
+// GetSessionTable returns the cached session.TableAPI for (resource, method),
+// constructing one via session Client on cache miss. The returned release
 // thunk MUST be called once the caller is done with the handle, even on
 // error from the dispatched RPC.
-func (rm *ResourceManager) GetSessionTable(resource, method string) (session.SessionTableApi, func(), error) {
+func (rm *ResourceManager) GetSessionTable(resource, method string) (session.TableAPI, func(), error) {
 	return rm.cache.GetOrOpen(resource, method)
 }
 
-// Close closes every cached SessionTableApi, then closes the underlying
-// SessionClient connection.
+// Close closes every cached session.TableAPI, then closes the underlying
+// session Client connection.
 func (rm *ResourceManager) Close() error {
 	var firstErr error
 	if rm.cache != nil {
