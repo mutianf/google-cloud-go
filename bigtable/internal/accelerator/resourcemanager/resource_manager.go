@@ -49,24 +49,23 @@ func TestHookSessionClient(f SessionClientFactory) func() {
 	return func() { newSessionClient = orig }
 }
 
-// ResourceManager owns a session Client and a PoolCache of per-(resource,
-// method) session.TableAPI instances. On cache hit, GetSessionTable returns
-// the cached entry without consulting SessionClient. On miss, it opens a
-// fresh session.TableAPI via the session Client and caches it.
+// ResourceManager owns a session Client and vends per-resource
+// session.TableAPI handles to the accelerator's dispatch path.
 //
-// Wire format note: V2 RPCs carry a full table resource name
-// ("projects/P/instances/I/tables/T"). session.Client.OpenTable
-// prepends the project/instance/tables/ prefix itself, so ResourceManager
-// hands it just the leaf segment.
+// It deliberately does NOT cache the handles. session.Client already
+// dedupes the expensive resource — the per-(resource, permission) read and
+// write session pools — inside sessionClient.getOrCreateSessionPool, so
+// repeated OpenTable calls for the same table share the same underlying
+// pools. The handles OpenTable returns are cheap wrappers whose Close is a
+// no-op today (see internal/session/table.go), so there is nothing worth
+// pooling at this layer.
 type ResourceManager struct {
-	sc    session.Client
-	cache *PoolCache[session.TableAPI]
+	sc session.Client
 }
 
 // New dials Bigtable via internal/session and constructs a ResourceManager
 // scoped to (project, instance, appProfile). The ResourceManager takes
-// ownership of the session Client — Close releases the cache and then the
-// SessionClient connection.
+// ownership of the session Client — Close releases it.
 func New(
 	ctx context.Context,
 	project, instance, appProfile string,
@@ -76,41 +75,36 @@ func New(
 	if err != nil {
 		return nil, err
 	}
-	rm := &ResourceManager{sc: sc}
-	rm.cache = NewPoolCache[session.TableAPI](DefaultPoolCacheSize, rm.openSessionTable)
-	return rm, nil
+	return &ResourceManager{sc: sc}, nil
 }
 
-// openSessionTable is the PoolCache factory invoked on cache miss. It is a
-// method (not a closure) so ResourceManager.sc remains the only reference to
-// the session Client — no captured-state lifetime issues.
-func (rm *ResourceManager) openSessionTable(resource, _ string) (session.TableAPI, error) {
-	return rm.sc.OpenTable(tableLeaf(resource)), nil
-}
+// noopRelease is returned by GetSessionTable. Handles are not pooled here, so
+// there is nothing to release; the thunk keeps call sites uniform and leaves
+// room to reintroduce pooling later without touching callers.
+func noopRelease() {}
 
-// GetSessionTable returns the cached session.TableAPI for (resource, method),
-// constructing one via session Client on cache miss. The returned release
-// thunk MUST be called once the caller is done with the handle, even on
-// error from the dispatched RPC.
+// GetSessionTable returns a session.TableAPI for the table named by resource.
+//
+// Wire format note: V2 RPCs carry a full table resource name
+// ("projects/P/instances/I/tables/T"). session.Client.OpenTable prepends the
+// project/instance/tables/ prefix itself, so ResourceManager hands it just
+// the leaf segment.
+//
+// method is accepted for call-site clarity ("ReadRow" / "MutateRow") but does
+// not affect which handle is returned: OpenTable vends a single handle that
+// routes reads and writes to their respective pools internally. The returned
+// release thunk is a no-op.
 func (rm *ResourceManager) GetSessionTable(resource, method string) (session.TableAPI, func(), error) {
-	return rm.cache.GetOrOpen(resource, method)
+	return rm.sc.OpenTable(tableLeaf(resource)), noopRelease, nil
 }
 
-// Close closes every cached session.TableAPI, then closes the underlying
-// session Client connection.
+// Close closes the underlying session Client, tearing down its pools. Handles
+// previously returned by GetSessionTable become unusable afterwards.
 func (rm *ResourceManager) Close() error {
-	var firstErr error
-	if rm.cache != nil {
-		if err := rm.cache.Close(); err != nil {
-			firstErr = err
-		}
-	}
 	if rm.sc != nil {
-		if err := rm.sc.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		return rm.sc.Close()
 	}
-	return firstErr
+	return nil
 }
 
 // tableLeaf extracts the leaf "T" from "projects/P/instances/I/tables/T".

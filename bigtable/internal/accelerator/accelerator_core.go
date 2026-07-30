@@ -129,9 +129,9 @@ func (c *AcceleratorChannel) mutateRowImpl(ctx context.Context, args, reply inte
 		return err
 	}
 
-	// ResourceManager caches by (resource, method); MutateRow keys with
-	// "MutateRow" so read and write entries stay independent. On cache hit
-	// the SessionClient is not consulted.
+	// ResourceManager opens a fresh handle per call; the underlying read/
+	// write session pools are deduped inside session.Client, so this is
+	// cheap. release is a no-op (handles are not pooled at this layer).
 	tbl, release, err := c.rm.GetSessionTable(resource, "MutateRow")
 	if err != nil {
 		return err
@@ -169,8 +169,7 @@ func (c *AcceleratorChannel) NewStream(ctx context.Context, _ *grpc.StreamDesc, 
 }
 
 // Close releases resources held by the channel by closing the ResourceManager
-// (which closes every cached SessionTableApi, then the SessionClient
-// connection).
+// (which closes the underlying session Client and all its pools).
 func (c *AcceleratorChannel) Close() error {
 	if c.rm == nil {
 		return nil
