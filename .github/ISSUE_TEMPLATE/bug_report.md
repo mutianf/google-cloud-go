@@ -7,52 +7,42 @@ assignees: ''
 
 ---
 
-## Client
+**Client**
 
 e.g. PubSub
 
-## Environment
+**Environment**
 
 e.g. Alpine Docker on GKE
-e.g. $ go version
 
-## Code and Dependencies
+**Go Environment**
 
+$ go version
+$ go env
+
+**Code**
+
+e.g.
 ```go
 package main
 
 func main() {
-  // ...
+	// ...
 }
 ```
 
-<details>
-  <summary>go.mod</summary>
-
-```text
-module modname
-
-go 1.25.0
-
-require (
-   // ...
-)
-```
-
-</details>
-
-## Expected behavior
+**Expected behavior**
 
 e.g. Messages arrive really fast.
 
-## Actual behavior
+**Actual behavior**
 
 e.g. Messages arrive really slowly.
 
-## Screenshots
+**Screenshots**
 
 e.g. A chart showing how messages are slow. Delete if not necessary.
 
-## Additional context
+**Additional context**
 
 e.g. Started after upgrading to v0.50.0.
