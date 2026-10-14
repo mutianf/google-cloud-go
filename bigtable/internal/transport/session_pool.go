@@ -192,6 +192,24 @@ type SessionPoolImpl struct {
 	// Pure atomic-counter bumps (msgsSent, retries, etc.) are NOT
 	// gated — a branch check costs more than the atomic.
 	debugEnabled bool
+
+	// channelRecycler is called when a session closes due to a server-sent
+	// GOAWAY, signalling that the underlying gRPC connection should be
+	// replaced so the next createSession attempt is not routed to the same
+	// draining/overloaded backend. The int32 argument is the channel pool
+	// index from session.ChannelIndex(). Nil when not backed by a
+	// BigtableChannelPool (e.g. tests using a stub streamFactory).
+	// Set once before Start() by SetChannelRecycler; safe to read from
+	// any goroutine after Start().
+	channelRecycler func(channelIndex int32)
+}
+
+// SetChannelRecycler wires a channel-recycle callback. Must be called before
+// Start(). When a session closes with a server-sent GOAWAY, the pool calls
+// f(channelIndex) so the channel pool can replace the underlying gRPC
+// connection and redirect subsequent sessions to a different backend.
+func (p *SessionPoolImpl) SetChannelRecycler(f func(channelIndex int32)) {
+	p.channelRecycler = f
 }
 
 // noteVRpcOutcome forwards the outcome to the AFE's PeakEwma trackers

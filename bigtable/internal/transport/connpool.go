@@ -731,6 +731,20 @@ func (p *BigtableChannelPool) replaceConnection(oldEntry *connEntry) {
 	go p.waitForDrainAndClose(oldEntry)
 }
 
+// RecycleConnAtIndex replaces the connection at the given pool index with a
+// fresh dial. Called by the session pool when a session reports a server-sent
+// GOAWAY on that channel so subsequent sessions are routed to a different
+// backend rather than the draining one. No-op if idx is out of range or the
+// entry is already marked as draining (replaceConnection is idempotent via
+// markAsDraining CAS).
+func (p *BigtableChannelPool) RecycleConnAtIndex(idx int32) {
+	conns := p.getConns()
+	if idx < 0 || int(idx) >= len(conns) {
+		return
+	}
+	p.replaceConnection(conns[idx])
+}
+
 // Invoke selects the least loaded connection and calls Invoke on it.
 // This method provides automatic load tracking.
 // Load is tracked as a unary call.

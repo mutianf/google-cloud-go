@@ -358,6 +358,7 @@ func (p *SessionPoolImpl) onClose(sh *SessionHandle, err error) {
 		p.mu.Unlock()
 		p.bumpStartingClose(sh.session)
 		p.noteAbnormalCloseIfAny(sh)
+		p.maybeRecycleChannel(sh)
 		// Re-drive creation after a session died before ever reaching
 		// Ready. This is the load-bearing fix for the deadline-less
 		// CheckoutSession hang: a session that dies in Starting fires
@@ -391,6 +392,28 @@ func (p *SessionPoolImpl) onClose(sh *SessionHandle, err error) {
 	p.sl.OnSessionClosed(sh)
 	p.recordSessionClose(sh.session, "")
 	p.noteAbnormalCloseIfAny(sh)
+	p.maybeRecycleChannel(sh)
+}
+
+// maybeRecycleChannel fires p.channelRecycler when a session closes due to a
+// server-sent GOAWAY. GOAWAY means the server is draining that backend; by
+// replacing the underlying gRPC connection, the next createSession attempt
+// load-balances to a different (healthy) backend rather than the same draining
+// one. Java's ChannelPoolDpImpl.shouldRecycleChannel / recycleChannel is the
+// equivalent. replaceConnection is idempotent (guarded by markAsDraining CAS),
+// so concurrent calls for multiple sessions on the same channel are safe.
+func (p *SessionPoolImpl) maybeRecycleChannel(sh *SessionHandle) {
+	if p.channelRecycler == nil || sh == nil || sh.session == nil {
+		return
+	}
+	if sh.session.CloseReason() != "GoAway" {
+		return
+	}
+	idx := sh.session.ChannelIndex()
+	if idx < 0 {
+		return
+	}
+	p.channelRecycler(idx)
 }
 
 // noteAbnormalCloseIfAny bumps the consecutive-failure counter when a

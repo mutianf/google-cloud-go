@@ -758,6 +758,15 @@ func (sc *sessionClient) createSessionPool(
 		poolName, streamFactory, openSessionRequest, md, sessionType,
 		sc.enableDebug,
 	)
+	// Wire channel recycling: when a session reports a server-sent GOAWAY,
+	// replace the underlying gRPC connection so the next createSession is
+	// routed to a different (non-draining) backend. Mirrors Java's
+	// ChannelPoolDpImpl.shouldRecycleChannel / recycleChannel on GOAWAY.
+	// Only wired when backed by a BigtableChannelPool; stub/classic paths
+	// leave channelRecycler nil and maybeRecycleChannel is a no-op.
+	if bp, ok := sc.channelPool.(*btransport.BigtableChannelPool); ok {
+		pool.SetChannelRecycler(bp.RecycleConnAtIndex)
+	}
 	mp := &managedSessionPool{id: id, key: key, pool: pool}
 	sc.sessionPools[id] = mp
 	configManager := sc.configManager
